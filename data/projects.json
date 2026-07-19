@@ -13,75 +13,50 @@
     "totals_url": "https://proto.beebotix.com/Payment/totals"
   },
   "tiers": [
-    {
-      "label": "Supporter",
-      "amount": 199
-    },
-    {
-      "label": "Backer",
-      "amount": 499
-    },
-    {
-      "label": "Sponsor",
-      "amount": 1000
-    },
-    {
-      "label": "Patron",
-      "amount": 2500
-    }
+    { "label": "Supporter", "amount": 199 },
+    { "label": "Backer", "amount": 499 },
+    { "label": "Sponsor", "amount": 1000 },
+    { "label": "Patron", "amount": 2500 }
   ],
   "projects": [
     {
-      "id": "swarm-bots",
-      "title": "Swarm robotics testbed",
+      "id": "chhavi",
+      "title": "CHHAVI, robotic bird",
       "status": "active",
-      "description": "Twelve small differential drive robots that coordinate without a central controller. Open firmware, printable chassis.",
-      "goal": 25000,
-      "raised": 8400,
-      "goal_for": "Motor drivers, IMUs and a year of bench time",
-      "link": "https://github.com/yourname/swarm-bots",
+      "description": "A flapping wing ornithopter with onboard AI for long endurance flight. It is built to pass for a bird in the sky while it maps the terrain below, so autonomous drones have something to navigate by.",
+      "goal": 100000,
+      "raised": 0,
+      "goal_for": "Airframe, servos, flight controller and wind tunnel time",
+      "link": "",
       "checkout_url": "",
-      "image": "https://images.unsplash.com/photo-1518314916381-77a37c2a49ae?w=900&h=500&fit=crop&auto=format&q=70",
-      "image_alt": "Two small wheeled robots on a workbench"
+      "image": "https://picsum.photos/seed/chhavi/900/500",
+      "image_alt": "Placeholder image for the CHHAVI robotic bird"
     },
     {
-      "id": "farm-sensor",
-      "title": "Low cost soil sensor node",
+      "id": "swarm-vtol",
+      "title": "SWARM VTOL",
       "status": "active",
-      "description": "A solar LoRa node that reports soil moisture from fields with no mobile coverage. Built to survive a Bengal monsoon.",
-      "goal": 12000,
-      "raised": 11200,
-      "goal_for": "Weatherproof enclosures and the first field trial",
+      "description": "A vertical take off aircraft that holds its heading by visual compass alone, so it keeps flying where GPS is jammed or absent. Hardening it against microwave attack is part of the same problem.",
+      "goal": 200000,
+      "raised": 0,
+      "goal_for": "Vision stack, shielded electronics and flight testing",
       "link": "",
       "checkout_url": "",
-      "image": "https://images.unsplash.com/photo-1532929900024-6413d2ed39c8?w=900&h=500&fit=crop&auto=format&q=70",
-      "image_alt": "A farmer working a flooded paddy field in Kerala"
+      "image": "https://picsum.photos/seed/swarmvtol/900/500",
+      "image_alt": "Placeholder image for the SWARM VTOL aircraft"
     },
     {
-      "id": "braille-pad",
-      "title": "Refreshable braille pad",
+      "id": "fpv-autonomous",
+      "title": "FPV autonomous drone",
       "status": "upcoming",
-      "description": "A single line braille display built from piezo actuators, aiming at a tenth of the usual price.",
-      "goal": 40000,
+      "description": "A first person view drone that can fly a route on its own once the pilot lets go of the sticks.",
+      "goal": 180000,
       "raised": 0,
-      "goal_for": "Piezo bender stock and a working prototype",
+      "goal_for": "Frames, motors, cameras and a first build run",
       "link": "",
       "checkout_url": "",
-      "image": "https://images.unsplash.com/photo-1574887427561-d3d5d58c9273?w=900&h=500&fit=crop&auto=format&q=70",
-      "image_alt": "Hands reading a refreshable braille display"
-    },
-    {
-      "id": "arm-v2",
-      "title": "Desktop robotic arm, version two",
-      "status": "upcoming",
-      "description": "Five axis arm with harmonic drives, sourced entirely from Indian suppliers. Documentation in Hindi and Bengali too.",
-      "goal": 60000,
-      "raised": 0,
-      "goal_for": "Machined parts for the first ten units",
-      "link": "",
-      "checkout_url": "",
-      "image": "https://images.unsplash.com/photo-1531746790731-6c087fecd65a?w=900&h=500&fit=crop&auto=format&q=70",
-      "image_alt": "Close up of a white robotic arm and hand"
+      "image": "https://picsum.photos/seed/fpvdrone/900/500",
+      "image_alt": "Placeholder image for the FPV autonomous drone"
     }
   ]
 }
