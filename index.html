@@ -1,0 +1,786 @@
+"""
+Beebotix Payment Node
+=====================
+A self-contained payment service for the Beebotix support site.
+
+The main site is a static page (GitHub Pages). It collects only the amount,
+then embeds this service in an <iframe>. Everything from that point on -
+choosing a project, entering name and contact, the message, and the payment
+itself - happens inside the iframe, served from here. The host page never
+navigates away.
+
+Payment states exposed to the host: SUCCESS, FAILED, WAIT (pending).
+
+How the three tricky outcomes are handled
+-----------------------------------------
+- FAILED  : Cashfree marks the order; /status and /result report FAILED.
+- PENDING : order stays ACTIVE -> mapped to WAIT; the result page polls /status.
+- DROPPED : the browser sends nothing when a user leaves. So we do not wait for
+            the browser. Two server-side safety nets catch it:
+              1. Webhook  - Cashfree calls /webhook server to server when a
+                 payment resolves, whatever the browser did.
+              2. Reconcile- a background sweep re-checks orders still ACTIVE
+                 after a while and closes out abandoned ones.
+            We also set order_expiry_time so Cashfree auto-expires dead orders.
+
+Storage
+-------
+Everything lands in data/payments.json on this machine. That file is the
+record of who paid, how much, towards which project, and what they wrote.
+Writes are atomic and guarded by a lock, so a crash mid-write cannot corrupt
+it. Nothing leaves your home server except the calls to Cashfree.
+
+The secret key never leaves the server. The iframe only ever receives a
+payment_session_id, which is safe to expose to the browser.
+"""
+
+import asyncio
+import base64
+import hashlib
+import hmac
+import json
+import os
+import re
+import threading
+import traceback
+import uuid
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from urllib.parse import urlsplit
+from urllib.request import urlopen
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+
+from cashfree_pg.api_client import Cashfree
+from cashfree_pg.models.create_order_request import CreateOrderRequest
+from cashfree_pg.models.customer_details import CustomerDetails
+from cashfree_pg.models.order_meta import OrderMeta
+
+load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Configuration - everything from environment / .env, nothing hardcoded
+# ---------------------------------------------------------------------------
+CLIENT_ID = os.getenv("CASHFREE_CLIENT_ID", "")
+CLIENT_SECRET = os.getenv("CASHFREE_CLIENT_SECRET", "")
+ENV = os.getenv("CASHFREE_ENV", "SANDBOX").upper()
+
+# Public URL where this node is reachable. Cashfree redirects the user back
+# here and calls the webhook here, so in production it must be reachable from
+# the internet - a real https URL, not localhost.
+BASE_URL = os.getenv("PAYMENT_NODE_BASE_URL", "http://localhost:5000").rstrip("/")
+
+# Origins allowed to embed this in an iframe and receive postMessage.
+# Comma separated. Use * only for local testing.
+def _to_origin(value: str) -> str:
+    """Reduce whatever was pasted to a bare origin.
+
+    People paste the address bar - "http://127.0.0.1:5500/SupportMe/index.html"
+    - but frame-ancestors and CORS both want scheme://host:port and nothing
+    else. A path there makes the whole entry invalid and the browser silently
+    refuses to frame the form, so trim it rather than let it fail quietly.
+    """
+    value = value.strip()
+    if not value or value == "*":
+        return value
+    if "://" not in value:
+        value = "http://" + value
+    parts = urlsplit(value)
+    return f"{parts.scheme}://{parts.netloc}" if parts.netloc else value.rstrip("/")
+
+
+ALLOWED_PARENT_ORIGINS = []
+for _raw in os.getenv("ALLOWED_PARENT_ORIGINS", "*").split(","):
+    _origin = _to_origin(_raw)
+    if _origin and _origin not in ALLOWED_PARENT_ORIGINS:
+        ALLOWED_PARENT_ORIGINS.append(_origin)
+
+# Where the project list comes from. A URL to the live site's projects.json
+# keeps one source of truth; the local file is the fallback when that is
+# unreachable.
+PROJECTS_URL = os.getenv("PROJECTS_URL", "").strip()
+PROJECTS_FILE = Path(os.getenv("PROJECTS_FILE", "data/projects.json"))
+PROJECTS_TTL_SECONDS = int(os.getenv("PROJECTS_TTL_SECONDS", "300"))
+
+# Where payments are stored on this machine.
+PAYMENTS_FILE = Path(os.getenv("PAYMENTS_FILE", "data/payments.json"))
+
+# Amount guardrails, in rupees.
+MIN_AMOUNT = float(os.getenv("MIN_AMOUNT", "10"))
+MAX_AMOUNT = float(os.getenv("MAX_AMOUNT", "100000"))
+
+def _is_public_url(url: str) -> bool:
+    """Can Cashfree's servers reach this? Anything local, they cannot."""
+    host = urlsplit(url).hostname or ""
+    local = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
+    return bool(host) and host not in local and not host.endswith(".local")
+
+
+WEBHOOK_REACHABLE = _is_public_url(BASE_URL)
+
+ORDER_EXPIRY_MINUTES = int(os.getenv("ORDER_EXPIRY_MINUTES", "20"))
+RECONCILE_EVERY_SECONDS = int(os.getenv("RECONCILE_EVERY_SECONDS", "60"))
+
+# Seconds the success screen waits before returning itself to a fresh form.
+
+# Where the checkout opens.
+#   _modal  - popup over the form. The only target that reliably stays inside
+#             an iframe; "_self" lets the SDK navigate the whole host window,
+#             which throws the visitor off your site mid-payment.
+#   _blank  - new tab, form polls for the result. Use if the popup is blocked.
+#   _self   - navigates this frame. Only sensible when not embedded.
+CHECKOUT_TARGET = os.getenv("CHECKOUT_TARGET", "_modal")
+
+# Token guarding the endpoints that expose supporter details.
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
+
+cf = Cashfree(
+    XEnvironment=Cashfree.SANDBOX if ENV == "SANDBOX" else Cashfree.PRODUCTION,
+    XClientId=CLIENT_ID,
+    XClientSecret=CLIENT_SECRET,
+)
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _map_status(order_status: str) -> str:
+    """Map Cashfree's order_status onto our three simple states."""
+    order_status = (order_status or "").upper()
+    if order_status == "PAID":
+        return "SUCCESS"
+    if order_status == "ACTIVE":
+        return "WAIT"
+    return "FAILED"
+
+
+# ---------------------------------------------------------------------------
+# Storage. A JSON file on this machine, written atomically under a lock.
+#
+#   {
+#     "payments": { "<order_id>": { ...record... } },
+#     "totals":   { "<project_id>": 8400.0 }
+#   }
+#
+# Atomic means: write a temp file, flush it to disk, then rename over the real
+# one. A rename is atomic on every OS we care about, so a crash leaves either
+# the old file or the new one, never a half-written one.
+# ---------------------------------------------------------------------------
+_store_lock = threading.Lock()
+
+
+def _empty_store() -> dict:
+    return {"payments": {}, "totals": {}}
+
+
+def _read_store() -> dict:
+    """Read the store, healing an empty or damaged file instead of dying.
+
+    A zero byte file is the normal case on a fresh checkout - Windows and git
+    both like to leave one behind - so that is treated as "no payments yet"
+    without any noise. A file with real but unparseable content is different:
+    that could be damaged data, so it is copied aside before being replaced.
+    """
+    if not PAYMENTS_FILE.exists():
+        return _empty_store()
+
+    try:
+        raw = PAYMENTS_FILE.read_text(encoding="utf-8-sig").strip()
+    except OSError as exc:
+        print(f"[store] could not open {PAYMENTS_FILE}: {exc}")
+        return _empty_store()
+
+    if not raw:
+        return _empty_store()          # empty file, nothing to warn about
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        backup = PAYMENTS_FILE.with_suffix(f".broken-{_now():%Y%m%d-%H%M%S}.json")
+        try:
+            backup.write_text(raw, encoding="utf-8")
+            print(f"[store] {PAYMENTS_FILE} is not valid JSON ({exc}).")
+            print(f"[store] a copy was kept at {backup}; starting a fresh store.")
+        except OSError:
+            print(f"[store] {PAYMENTS_FILE} is not valid JSON and could not be backed up: {exc}")
+        return _empty_store()
+
+    if not isinstance(data, dict):
+        return _empty_store()
+
+    data.setdefault("payments", {})
+    data.setdefault("totals", {})
+    return data
+
+
+def _write_store(data: dict) -> None:
+    PAYMENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = PAYMENTS_FILE.with_suffix(".json.tmp")
+    with tmp.open("w", encoding="utf-8") as fh:
+        json.dump(data, fh, ensure_ascii=False, indent=2)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, PAYMENTS_FILE)
+
+
+def _get_payment(order_id: str) -> dict | None:
+    with _store_lock:
+        return _read_store()["payments"].get(order_id)
+
+
+def _save_payment(order_id: str, **fields) -> dict:
+    """Create or update one payment record. Never downgrades a resolved order."""
+    with _store_lock:
+        store = _read_store()
+        record = store["payments"].get(order_id, {})
+
+        incoming_state = fields.get("state")
+        settled = record.get("state") in ("SUCCESS", "FAILED")
+        if settled and incoming_state == "WAIT":
+            fields.pop("state", None)  # ignore a stale WAIT read
+
+        record.update({k: v for k, v in fields.items() if v is not None})
+        record.setdefault("order_id", order_id)
+        record.setdefault("created_at", _now().isoformat())
+        record["updated_at"] = _now().isoformat()
+
+        # Count a payment towards its project exactly once, on the transition
+        # into SUCCESS. Webhook and return page both land here, so this has to
+        # be idempotent.
+        if record.get("state") == "SUCCESS" and not record.get("counted"):
+            project = record.get("project_id") or "general"
+            amount = float(record.get("amount") or 0)
+            store["totals"][project] = round(
+                float(store["totals"].get(project, 0)) + amount, 2
+            )
+            record["counted"] = True
+            record["paid_at"] = record.get("paid_at") or _now().isoformat()
+
+        store["payments"][order_id] = record
+        _write_store(store)
+        return record
+
+
+# ---------------------------------------------------------------------------
+# Project list. Pulled from the live site when PROJECTS_URL is set, so the
+# dropdown here always matches the cards over there. Cached, with the local
+# file as a fallback.
+# ---------------------------------------------------------------------------
+_projects_cache: dict = {"at": None, "items": []}
+
+
+def _load_projects() -> list[dict]:
+    cached_at = _projects_cache["at"]
+    if cached_at and (_now() - cached_at).total_seconds() < PROJECTS_TTL_SECONDS:
+        return _projects_cache["items"]
+
+    raw = None
+    if PROJECTS_URL:
+        try:
+            with urlopen(PROJECTS_URL, timeout=6) as response:
+                raw = json.loads(response.read().decode("utf-8"))
+        except Exception as exc:  # noqa: BLE001 - fall back quietly
+            print(f"[projects] remote fetch failed, using local file: {exc}")
+
+    if raw is None and PROJECTS_FILE.exists():
+        try:
+            text = PROJECTS_FILE.read_text(encoding="utf-8-sig").strip()
+            raw = json.loads(text) if text else None
+            if raw is None:
+                print(f"[projects] {PROJECTS_FILE} is empty. The form will offer the general fund only.")
+        except (json.JSONDecodeError, OSError) as exc:
+            print(f"[projects] could not read {PROJECTS_FILE}: {exc}")
+            print("[projects] the form will offer the general fund only.")
+
+    items = []
+    for project in (raw or {}).get("projects", []):
+        if project.get("status") == "active":
+            items.append({"id": project["id"], "title": project["title"]})
+    items.append({"id": "general", "title": "Wherever it is needed"})
+
+    _projects_cache["at"] = _now()
+    _projects_cache["items"] = items
+    return items
+
+
+# ---------------------------------------------------------------------------
+# Background reconciliation: catch DROPPED and stuck orders the browser never
+# reported. Any order still WAIT past its expiry gets one authoritative check
+# against Cashfree; if still unresolved we close it as FAILED.
+# ---------------------------------------------------------------------------
+async def _reconcile_loop():
+    while True:
+        try:
+            cutoff = _now() - timedelta(minutes=ORDER_EXPIRY_MINUTES)
+            with _store_lock:
+                store = _read_store()
+                stale = [
+                    oid
+                    for oid, rec in store["payments"].items()
+                    if rec.get("state") == "WAIT"
+                    and rec.get("created_at", "") < cutoff.isoformat()
+                ]
+
+            for order_id in stale:
+                state, amount = _fetch_state(order_id)
+                if state == "WAIT":
+                    state = "FAILED"  # past expiry, nothing paid: abandoned
+                _save_payment(order_id, state=state, amount=amount, source="reconcile")
+                print(f"[reconcile] order={order_id} -> {state}")
+        except Exception as exc:  # noqa: BLE001 - never let the loop die
+            print(f"[reconcile] error: {exc}")
+        await asyncio.sleep(RECONCILE_EVERY_SECONDS)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    PAYMENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if not PAYMENTS_FILE.exists():
+        _write_store(_empty_store())
+    print(f"[start] environment  : {ENV}")
+    print(f"[start] base url     : {BASE_URL}")
+    print(f"[start] embed allowed: {', '.join(ALLOWED_PARENT_ORIGINS)}")
+    print(f"[start] storage      : {PAYMENTS_FILE.resolve()}")
+
+    if not (CLIENT_ID and CLIENT_SECRET):
+        print("[start] WARNING keys are missing. Set CASHFREE_CLIENT_ID and CASHFREE_CLIENT_SECRET in .env")
+    if not WEBHOOK_REACHABLE:
+        print("[start] NOTE base url is local, so no webhook is registered with the gateway.")
+        print("[start]      Payments still confirm through the return page and the reconcile sweep.")
+        print("[start]      Put your tunnel URL in PAYMENT_NODE_BASE_URL before going live.")
+    if "*" in ALLOWED_PARENT_ORIGINS:
+        print("[start] WARNING any site may embed this form. Set ALLOWED_PARENT_ORIGINS before going live.")
+
+    task = asyncio.create_task(_reconcile_loop())
+    yield
+    task.cancel()
+
+
+app = FastAPI(title="Beebotix Payment Node", lifespan=lifespan)
+app.mount("/static", StaticFiles(directory="static"), name="static")
+templates = Jinja2Templates(directory="templates")
+
+# The static site fetches /totals from a different origin, so it needs CORS.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_PARENT_ORIGINS or ["*"],
+    allow_methods=["GET"],
+    allow_headers=["*"],
+)
+
+
+@app.exception_handler(Exception)
+async def any_unhandled_error(request: Request, exc: Exception):
+    """Never let an unexpected error reach the browser as a bare 500.
+
+    FastAPI's default is plain text, which the payment form cannot read - the
+    supporter just sees a generic failure and the real cause is lost. Every
+    error now arrives as JSON with a detail field, and the full traceback is
+    printed here in the terminal.
+    """
+    print(f"[error] {request.method} {request.url.path} raised {type(exc).__name__}: {exc}")
+    traceback.print_exc()
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"Server error: {type(exc).__name__}. Check the payment node terminal."},
+    )
+
+
+@app.middleware("http")
+async def allow_iframe_embedding(request: Request, call_next):
+    """Permit framing by the host site. Deliberately no X-Frame-Options: DENY."""
+    response = await call_next(request)
+    if "*" in ALLOWED_PARENT_ORIGINS:
+        ancestors = "*"
+    else:
+        ancestors = "'self' " + " ".join(ALLOWED_PARENT_ORIGINS)
+    response.headers["Content-Security-Policy"] = f"frame-ancestors {ancestors};"
+    return response
+
+
+def _parent_origin() -> str:
+    return ALLOWED_PARENT_ORIGINS[0] if ALLOWED_PARENT_ORIGINS else "*"
+
+
+# ---------------------------------------------------------------------------
+# 0. Standalone demo - opening the node directly shows the form working.
+# ---------------------------------------------------------------------------
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    return f"""
+    <!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Beebotix Payment Node</title>
+    <style>
+      body{{margin:0;font-family:ui-monospace,monospace;background:#F4EDDC;
+           color:#141008;display:flex;flex-direction:column;align-items:center;
+           padding:32px 16px;}}
+      h1{{font-size:20px;margin:0 0 4px;text-transform:uppercase;}}
+      p{{font-size:13px;margin:0 0 20px;text-align:center;}}
+      iframe{{width:100%;max-width:520px;height:640px;border:4px solid #141008;background:#F4EDDC;}}
+      .banner{{max-width:520px;width:100%;margin-top:16px;padding:12px 14px;
+              font-size:13px;font-weight:600;display:none;border:4px solid #141008;}}
+      .banner.show{{display:block;}}
+      .SUCCESS{{background:#D6FF3F;}} .FAILED{{background:#D62828;color:#fff;}}
+      .WAIT{{background:#FFB302;}}
+    </style></head><body>
+      <h1>Beebotix payment node</h1>
+      <p>Standalone test. Environment: {ENV}. Keys configured: {bool(CLIENT_ID and CLIENT_SECRET)}.</p>
+      <iframe src="/pay?amount=499" allow="payment"></iframe>
+      <div class="banner" id="b"></div>
+      <script>
+        const b=document.getElementById("b");
+        const t={{WAIT:"Payment in progress",SUCCESS:"Payment successful",FAILED:"Payment failed"}};
+        window.addEventListener("message",e=>{{
+          const d=e.data||{{}};
+          if(d.source!=="beebotix-payment-node")return;
+          if(!d.status)return;
+          b.className="banner show "+d.status;
+          b.textContent=(t[d.status]||d.status)+(d.order_id?" ("+d.order_id+")":"");
+        }});
+      </script>
+    </body></html>
+    """
+
+
+@app.get("/favicon.ico")
+async def favicon():
+    return Response(status_code=204)
+
+
+# ---------------------------------------------------------------------------
+# 1. The form. THIS is what goes inside the <iframe>. The host page sends the
+#    amount; project, name, contact and message are collected here.
+# ---------------------------------------------------------------------------
+@app.get("/pay", response_class=HTMLResponse)
+async def pay(request: Request, amount: float = 0.0, project: str = ""):
+    return templates.TemplateResponse(
+        request=request,
+        name="pay.html",
+        context={
+            "amount": round(float(amount), 2),
+            "projects": _load_projects(),
+            "selected_project": project,
+            "min_amount": MIN_AMOUNT,
+            "max_amount": MAX_AMOUNT,
+            "cf_mode": "sandbox" if ENV == "SANDBOX" else "production",
+            "checkout_target": CHECKOUT_TARGET,
+            "parent_origin": _parent_origin(),
+            "sandbox": ENV == "SANDBOX",
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# 2. Server-side order creation. Returns a payment_session_id to the browser.
+# ---------------------------------------------------------------------------
+@app.post("/create-order")
+async def create_order(
+    amount: float = Form(0),
+    name: str = Form(""),
+    contact: str = Form(""),
+    project: str = Form("general"),
+    message: str = Form(""),
+):
+    if not CLIENT_ID or not CLIENT_SECRET:
+        raise HTTPException(500, "Payment keys are not configured. Set them in .env")
+
+    try:
+        amount = round(float(amount), 2)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "Amount is not a number.")
+
+    if amount < MIN_AMOUNT:
+        raise HTTPException(400, f"Amount must be at least INR {MIN_AMOUNT:.0f}.")
+    if amount > MAX_AMOUNT:
+        raise HTTPException(400, f"Amount cannot exceed INR {MAX_AMOUNT:.0f}.")
+
+    name = name.strip()[:60]
+    if not name:
+        raise HTTPException(400, "Add a name so I know who to thank.")
+    if len(name) < 3:
+        # The gateway enforces a three character minimum on customer_name.
+        # Catching it here gives a sentence a person can act on instead of a
+        # pydantic validation dump.
+        raise HTTPException(400, "Please use at least 3 characters for your name.")
+
+    contact = contact.strip()
+    if not contact:
+        raise HTTPException(400, "Add an email address or phone number for the receipt.")
+
+    is_email = "@" in contact and "." in contact.split("@")[-1]
+    digits = re.sub(r"\D", "", contact)
+
+    if is_email:
+        email, phone = contact[:80], "9999999999"
+    elif len(digits) >= 10:
+        email, phone = "", digits[-10:]
+    else:
+        raise HTTPException(400, "Enter a valid email address or a 10 digit phone number.")
+
+    # The project field is a dropdown when named projects are open, and a free
+    # text box when none are. Anything that is not a known id is kept as a
+    # label against the general fund rather than thrown away - it is the
+    # supporter telling you what they want the money used for.
+    valid_ids = {p["id"] for p in _load_projects()}
+    project = project.strip()
+    if project in valid_ids:
+        project_id, project_label = project, ""
+    else:
+        project_id, project_label = "general", project[:60]
+
+    message = message.strip()[:300]
+
+    order_id = f"bbx_{uuid.uuid4().hex[:18]}"
+    expiry = (_now() + timedelta(minutes=ORDER_EXPIRY_MINUTES)).isoformat()
+
+    try:
+        customer = CustomerDetails(
+            customer_id=hashlib.sha256(contact.encode()).hexdigest()[:24],
+            customer_phone=phone,
+            customer_email=email or None,
+            customer_name=name,
+        )
+    # return_url is followed by the browser, so localhost is fine there.
+    # notify_url is called by Cashfree's own servers, and they reject an
+    # address they cannot reach - which is what a localhost base URL is. Send
+    # it only when it is genuinely reachable.
+        meta_kwargs = {"return_url": f"{BASE_URL}/result?order_id={{order_id}}"}
+        if WEBHOOK_REACHABLE:
+            meta_kwargs["notify_url"] = f"{BASE_URL}/webhook"
+        meta = OrderMeta(**meta_kwargs)
+        order_request = CreateOrderRequest(
+            order_id=order_id,
+            order_amount=amount,
+            order_currency="INR",
+            customer_details=customer,
+            order_meta=meta,
+            order_expiry_time=expiry,
+        )
+    except Exception as exc:  # noqa: BLE001 - pydantic validation, mostly
+        print(f"[create-order] rejected before sending: {exc}")
+        raise HTTPException(400, _readable_validation(exc))
+
+    try:
+        api_response = cf.PGCreateOrder(order_request)
+        data = getattr(api_response, "data", None)
+    except Exception as exc:  # noqa: BLE001
+        detail = _gateway_message(exc)
+        print(f"[create-order] gateway rejected the order: {exc}")
+        traceback.print_exc()
+        raise HTTPException(502, detail)
+
+    # A 200 with nothing usable in it is rare but real. Without this guard the
+    # next line raises AttributeError, which reaches the browser as a bare 500
+    # with no JSON body and no clue what went wrong.
+    if data is None or not getattr(data, "payment_session_id", None):
+        print(f"[create-order] gateway returned no session: {api_response!r}")
+        raise HTTPException(502, "The payment gateway did not return a session. Check the server log.")
+
+    # Store the supporter's details now. The gateway only carries the payment;
+    # the message and the project are ours to keep.
+    _save_payment(
+        data.order_id,
+        state="WAIT",
+        amount=amount,
+        name=name,
+        contact=contact,
+        email=email,
+        phone=phone,
+        project_id=project_id,
+        project_label=project_label or None,
+        message=message,
+        source="created",
+    )
+
+    return JSONResponse(
+        {"order_id": data.order_id, "payment_session_id": data.payment_session_id}
+    )
+
+
+# ---------------------------------------------------------------------------
+# 3. Return URL. Cashfree redirects the iframe here after payment. We verify
+#    the real status server-side - never trust the browser - and render it.
+# ---------------------------------------------------------------------------
+@app.get("/result", response_class=HTMLResponse)
+async def result(request: Request, order_id: str = ""):
+    state, amount = _fetch_state(order_id)
+    record = _save_payment(order_id, state=state, amount=amount, source="return") if order_id else {}
+
+    return templates.TemplateResponse(
+        request=request,
+        name="result.html",
+        context={
+            "state": state,
+            "order_id": order_id,
+            "amount": record.get("amount") or amount,
+            "name": record.get("name", ""),
+            "parent_origin": _parent_origin(),
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# 4. JSON status - polled by the result page while a payment is pending.
+# ---------------------------------------------------------------------------
+@app.get("/status/{order_id}")
+async def status(order_id: str):
+    state, amount = _fetch_state(order_id)
+    record = _save_payment(order_id, state=state, amount=amount, source="poll")
+    return {"order_id": order_id, "state": state, "amount": record.get("amount")}
+
+
+def _readable_validation(exc: Exception) -> str:
+    """Turn a pydantic ValidationError into a sentence a supporter can act on."""
+    errors = getattr(exc, "errors", None)
+    if callable(errors):
+        try:
+            first = exc.errors()[0]
+            field = str(first.get("loc", ["field"])[-1]).replace("customer_", "").replace("_", " ")
+            message = first.get("msg", "is not valid")
+            return f"The {field} {message[0].lower() + message[1:]}"
+        except Exception:  # noqa: BLE001
+            pass
+    return f"Those details were rejected: {str(exc)[:160]}"
+
+
+def _gateway_message(exc: Exception) -> str:
+    """Pull something readable out of a Cashfree SDK exception.
+
+    The SDK raises ApiException carrying the API's own JSON, which usually
+    names the exact field it disliked. That is far more useful on screen than
+    a generic apology, and this is the owner's own payment page.
+    """
+    body = getattr(exc, "body", None)
+    if body:
+        try:
+            parsed = json.loads(body if isinstance(body, str) else body.decode())
+            message = parsed.get("message") or parsed.get("error_description")
+            code = parsed.get("code") or parsed.get("type")
+            if message:
+                return f"Gateway: {message} [{code}]" if code else f"Gateway: {message}"
+        except Exception:  # noqa: BLE001
+            return f"Gateway error: {str(body)[:200]}"
+
+    status = getattr(exc, "status", None)
+    if status == 401:
+        return "Gateway rejected the credentials. Check CASHFREE_CLIENT_ID and CASHFREE_CLIENT_SECRET."
+    if status:
+        return f"Gateway returned HTTP {status}. Check the server log."
+    return f"Could not reach the payment gateway: {type(exc).__name__}"
+
+
+def _fetch_state(order_id: str):
+    """Ask Cashfree for the authoritative order status."""
+    if not order_id:
+        return "FAILED", None
+    try:
+        api_response = cf.PGFetchOrder(order_id)
+        data = api_response.data
+        return _map_status(data.order_status), data.order_amount
+    except Exception as exc:  # noqa: BLE001
+        print(f"[fetch] order={order_id}: {exc}")
+        return "FAILED", None
+
+
+# ---------------------------------------------------------------------------
+# 5. Webhook. Cashfree pushes updates here server to server. This is the
+#    reliable source of truth: it arrives even if the user's browser died.
+# ---------------------------------------------------------------------------
+@app.post("/webhook")
+async def webhook(request: Request):
+    raw_body = await request.body()
+    timestamp = request.headers.get("x-webhook-timestamp", "")
+    signature = request.headers.get("x-webhook-signature", "")
+
+    if not _verify_webhook(raw_body, timestamp, signature):
+        raise HTTPException(401, "Invalid webhook signature")
+
+    try:
+        payload = json.loads(raw_body)
+    except json.JSONDecodeError:
+        raise HTTPException(400, "Bad JSON")
+
+    event_type = payload.get("type", "")
+    order = payload.get("data", {}).get("order", {})
+    order_id = order.get("order_id")
+
+    if order_id:
+        state = _map_status(order.get("order_status", ""))
+        _save_payment(
+            order_id,
+            state=state,
+            amount=order.get("order_amount"),
+            source="webhook",
+        )
+        print(f"[webhook] {event_type} order={order_id} -> {state}")
+
+    return {"received": True}
+
+
+def _verify_webhook(raw_body: bytes, timestamp: str, signature: str) -> bool:
+    """Cashfree signature = base64(HMAC-SHA256(timestamp + rawBody, secret))."""
+    if not signature or not timestamp:
+        return False
+    signed = timestamp.encode() + raw_body
+    digest = hmac.new(CLIENT_SECRET.encode(), signed, hashlib.sha256).digest()
+    expected = base64.b64encode(digest).decode()
+    return hmac.compare_digest(expected, signature)
+
+
+# ---------------------------------------------------------------------------
+# 6. Public read endpoints. /totals is what the static site polls to refresh
+#    the funding bars - it exposes sums only, never a supporter's details.
+# ---------------------------------------------------------------------------
+@app.get("/totals")
+async def totals():
+    with _store_lock:
+        store = _read_store()
+    return {
+        "totals": store["totals"],
+        "supporters": sum(
+            1 for r in store["payments"].values() if r.get("state") == "SUCCESS"
+        ),
+        "updated": _now().isoformat(),
+    }
+
+
+@app.get("/projects")
+async def projects():
+    return {"projects": _load_projects()}
+
+
+@app.get("/payments")
+async def payments(token: str = ""):
+    """Full records including names and messages. Requires ADMIN_TOKEN."""
+    if not ADMIN_TOKEN or not hmac.compare_digest(token, ADMIN_TOKEN):
+        raise HTTPException(401, "Set ADMIN_TOKEN in .env and pass ?token=")
+    with _store_lock:
+        return _read_store()
+
+
+@app.get("/health")
+async def health():
+    with _store_lock:
+        store = _read_store()
+    return {
+        "status": "ok",
+        "env": ENV,
+        "keys_configured": bool(CLIENT_ID and CLIENT_SECRET),
+        "base_url": BASE_URL,
+        "payments_recorded": len(store["payments"]),
+        "storage": str(PAYMENTS_FILE.resolve()),
+    }
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run("main:app", host="0.0.0.0", port=5000, reload=True)
