@@ -1,0 +1,87 @@
+{
+  "creator": {
+    "name": "Sukarna Jana",
+    "handle": "A robotics bee who keeps buzzing",
+    "tagline": "I keep experimenting, in the hope that one of them clicks for humanity.",
+    "note": "Every rupee goes into parts, boards, hosting and hardware. Nothing else.",
+    "email": "you@example.com",
+    "updated": "19 July 2026",
+    "promise": "Every rupee you send is seed money. It buys the part, the board or the hour of bench time that turns an idea into something working. If one of these ever grows into something that matters, I will know exactly who paid for the first version of it, and I will say so."
+  },
+  "payment": {
+    "iframe_url":  "http://127.0.0.1:5000/pay",
+    "totals_url":  "http://127.0.0.1:5000/totals"
+  },
+  "tiers": [
+    {
+      "label": "Supporter",
+      "amount": 199
+    },
+    {
+      "label": "Backer",
+      "amount": 499
+    },
+    {
+      "label": "Sponsor",
+      "amount": 1000
+    },
+    {
+      "label": "Patron",
+      "amount": 2500
+    }
+  ],
+  "projects": [
+    {
+      "id": "swarm-bots",
+      "title": "Swarm robotics testbed",
+      "status": "active",
+      "description": "Twelve small differential drive robots that coordinate without a central controller. Open firmware, printable chassis.",
+      "goal": 25000,
+      "raised": 8400,
+      "goal_for": "Motor drivers, IMUs and a year of bench time",
+      "link": "https://github.com/yourname/swarm-bots",
+      "checkout_url": "",
+      "image": "https://images.unsplash.com/photo-1518314916381-77a37c2a49ae?w=900&h=500&fit=crop&auto=format&q=70",
+      "image_alt": "Two small wheeled robots on a workbench"
+    },
+    {
+      "id": "farm-sensor",
+      "title": "Low cost soil sensor node",
+      "status": "active",
+      "description": "A solar LoRa node that reports soil moisture from fields with no mobile coverage. Built to survive a Bengal monsoon.",
+      "goal": 12000,
+      "raised": 11200,
+      "goal_for": "Weatherproof enclosures and the first field trial",
+      "link": "",
+      "checkout_url": "",
+      "image": "https://images.unsplash.com/photo-1532929900024-6413d2ed39c8?w=900&h=500&fit=crop&auto=format&q=70",
+      "image_alt": "A farmer working a flooded paddy field in Kerala"
+    },
+    {
+      "id": "braille-pad",
+      "title": "Refreshable braille pad",
+      "status": "upcoming",
+      "description": "A single line braille display built from piezo actuators, aiming at a tenth of the usual price.",
+      "goal": 40000,
+      "raised": 0,
+      "goal_for": "Piezo bender stock and a working prototype",
+      "link": "",
+      "checkout_url": "",
+      "image": "https://images.unsplash.com/photo-1574887427561-d3d5d58c9273?w=900&h=500&fit=crop&auto=format&q=70",
+      "image_alt": "Hands reading a refreshable braille display"
+    },
+    {
+      "id": "arm-v2",
+      "title": "Desktop robotic arm, version two",
+      "status": "upcoming",
+      "description": "Five axis arm with harmonic drives, sourced entirely from Indian suppliers. Documentation in Hindi and Bengali too.",
+      "goal": 60000,
+      "raised": 0,
+      "goal_for": "Machined parts for the first ten units",
+      "link": "",
+      "checkout_url": "",
+      "image": "https://images.unsplash.com/photo-1531746790731-6c087fecd65a?w=900&h=500&fit=crop&auto=format&q=70",
+      "image_alt": "Close up of a white robotic arm and hand"
+    }
+  ]
+}
