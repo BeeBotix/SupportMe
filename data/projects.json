@@ -9,8 +9,8 @@
     "promise": "Every rupee you send is seed money. It buys the part, the board or the hour of bench time that turns an idea into something working. If one of these ever grows into something that matters, I will know exactly who paid for the first version of it, and I will say so."
   },
   "payment": {
-    "iframe_url":  "http://127.0.0.1:5000/pay",
-    "totals_url":  "http://127.0.0.1:5000/totals"
+    "iframe_url": "https://proto.beebotix.com/Payment/pay",
+    "totals_url": "https://proto.beebotix.com/Payment/totals"
   },
   "tiers": [
     {
