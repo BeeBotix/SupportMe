@@ -5,7 +5,7 @@
     "tagline": "I keep experimenting, in the hope that one of them clicks for humanity.",
     "note": "Every rupee goes into parts, boards, hosting and hardware. Nothing else.",
     "email": "sukarna@beebotix.com",
-    "updated": "19 July 2026",
+    "updated": "20 July 2026",
     "promise": "Every rupee you send is seed money. It buys the part, the board or the hour of bench time that turns an idea into something working. If one of these ever grows into something that matters, I will know exactly who paid for the first version of it, and I will say so."
   },
   "payment": {
@@ -38,7 +38,7 @@
       "status": "active",
       "description": "A vertical take off aircraft that holds its heading by visual compass alone, so it keeps flying where GPS is jammed or absent. Hardening it against microwave attack is part of the same problem.",
       "goal": 200000,
-      "raised": 0,
+      "raised": 610,
       "goal_for": "Vision stack, shielded electronics and flight testing",
       "link": "",
       "checkout_url": "",
